@@ -1,0 +1,15 @@
+{
+    "version": "1.0.0",
+    "name": "PerlyPay.name",
+    "description": "PerlyPay.description",
+    "icon": "bi-currency-bitcoin",
+    "logo": "views/default/images/logo.png",
+    "authors": [
+        {
+            "name": "Perly",
+            "url": "https://pay.perly.io"
+        }
+    ],
+    "currencies": ["USD", "EUR"],
+    "signup_url": "https://pay.perly.io"
+}
