@@ -13,7 +13,7 @@ if (!defined('DS')) {
 }
 
 if (!defined('PERLYPAY_BLESTA_VERSION')) {
-    define('PERLYPAY_BLESTA_VERSION', '1.0.0');
+    define('PERLYPAY_BLESTA_VERSION', '1.0.1');
 
     spl_autoload_register(static function (string $class): void {
         $roots = [

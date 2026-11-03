@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace PerlyPay\Blesta;
 
+use PerlyPay\Blesta\Vendor\Perly\Pay\Exception\PerlyPayException;
 use PerlyPay\Blesta\Vendor\Perly\Pay\Exception\SignatureVerificationException;
 use PerlyPay\Blesta\Vendor\Perly\Pay\PerlyPay;
 use PerlyPay\Blesta\Vendor\Perly\Pay\Webhook;
@@ -30,6 +31,16 @@ if (!defined('DS')) {
  *   invoice.expired / canceled                  → logged, no payment; the next visit makes a new invoice
  *   invoice.refunded, refund.*                  → logged
  *
+ * A signed event is not taken at its word: the webhook secret alone is not
+ * proof of payment. For invoice.* the invoice is retrieved from Perly Pay
+ * with the gateway's API key and only that answer is used (status, mode,
+ * fulfilment, amounts); an event it does not bear out (an "invoice.fulfilled"
+ * for an invoice still open) is acknowledged and ignored. For refund.* the
+ * refund is retrieved the same way, must be the one the event names and of
+ * the invoice it names, and its own status, amounts, address and transaction
+ * are what the log says: an address in a signed body is never one the admin
+ * is told to send to.
+ *
  * Blesta records what validate() returns (GatewayPayments::processNotification): it adds a transaction,
  * or edits the one with the same transaction id, applies it to the invoices when approved, and emails
  * the client each time. So the payment is handed over once: the Perly Pay invoice id is the
@@ -40,8 +51,8 @@ if (!defined('DS')) {
  *
  * Answers (validate() sets the HTTP status; Blesta's callback itself always answers 200): 200 for
  * every verified event (handed over, a duplicate, or not this company's), 400 for a bad signature,
- * 503 until configured or while another delivery is handing the same payment over — Perly Pay
- * retries anything but 2xx for 72 hours.
+ * 503 until configured, while another delivery is handing the same payment over, or while the
+ * invoice or the refund cannot be retrieved from Perly Pay — Perly Pay retries anything but 2xx for 72 hours.
  */
 final class Callback
 {
@@ -111,6 +122,20 @@ final class Callback
             // Another Blesta, another company or a shop on the same Perly Pay account made it: theirs to handle.
             return self::answer(200, ['received' => true, 'result' => 'not_ours']);
         }
+        // The webhook secret alone is not proof of payment: anyone who holds it (a developer who revealed it, a
+        // leaked config) can sign an "invoice.fulfilled" for any invoice, or a "refund.address_received" naming their
+        // own address. So the event only names the invoice or the refund; it is asked of Perly Pay with this
+        // gateway's own key, and that answer decides everything below.
+        $refund = str_starts_with($type, 'refund.');
+        $retrieved = $refund ? $this->retrieveRefund($row['pay_invoice'], $object['id'] ?? null, $id, $type) : $this->retrieve($row['pay_invoice'], $id, $type);
+        if (!isset($retrieved['id'])) {
+            return $retrieved;
+        }
+        $object = $retrieved;
+        if (!($refund ? self::refundAgrees($type, $object) : self::agrees($type, $object))) {
+            // Signed, but Perly Pay says otherwise (forged, or overtaken by a later event): nothing to do or retry.
+            return self::answer(200, ['received' => true, 'result' => 'not_what_perly_pay_says']);
+        }
         $mode = ($object['livemode'] ?? false) === true ? 'live' : 'test';
         if ($mode !== $row['mode']) {
             return self::answer(200, ['received' => true, 'result' => 'other_mode']);
@@ -118,7 +143,7 @@ final class Callback
 
         $fulfilled = !str_starts_with($type, 'refund.') && !empty($object['fulfilled_at'])
             && in_array($type, ['invoice.fulfilled', 'invoice.paid', 'invoice.overpaid'], true);
-        if ($type === 'invoice.fulfilled' || $fulfilled) {
+        if ($fulfilled) {
             return $this->handOver($row, $event, $object);
         }
         if ($this->store->hasEvent($row['pay_invoice'], $id)) {
@@ -281,6 +306,99 @@ final class Callback
         $this->log($details, true);
 
         return self::answer(200, ['received' => true, 'result' => 'refund_noted']);
+    }
+
+    /**
+     * The invoice as Perly Pay's API has it, or the answer to give when it cannot be had: 503 (Perly Pay retries) when
+     * there is no key or Perly Pay could not be asked, 200 "not_ours" when this key has no such invoice.
+     *
+     * @return array<string, mixed>
+     */
+    private function retrieve(string $payInvoice, string $eventId, string $type): array
+    {
+        if ($this->client === null) {
+            return self::answer(503, ['error' => 'no_api_key']);
+        }
+        try {
+            $invoice = $this->client->invoices->retrieve($payInvoice, ['max_retries' => 1]);
+        } catch (PerlyPayException $error) {
+            if ($error->getHttpStatus() === 404) {
+                return self::answer(200, ['received' => true, 'result' => 'not_ours']);
+            }
+            $this->log(['result' => 'Not applied yet: the invoice could not be retrieved from Perly Pay, which sends the event again', 'event' => $eventId, 'type' => $type, 'invoice' => $payInvoice, 'error' => $error->getErrorCode()], false);
+
+            return self::answer(503, ['error' => 'invoice_unavailable']);
+        }
+
+        return ($invoice['id'] ?? null) === $payInvoice ? $invoice : self::answer(200, ['received' => true, 'result' => 'not_ours']);
+    }
+
+    /**
+     * The refund as Perly Pay's API has it, which must be the refund the event named and of the row's invoice, or the
+     * answer to give when it cannot be had: 503 (Perly Pay retries) when there is no key or Perly Pay could not be
+     * asked, 200 "not_ours" when this key has no such refund.
+     *
+     * @return array<string, mixed>
+     */
+    private function retrieveRefund(string $payInvoice, mixed $refundId, string $eventId, string $type): array
+    {
+        if (!is_string($refundId) || $refundId === '') {
+            return self::answer(200, ['received' => true, 'result' => 'ignored']);
+        }
+        if ($this->client === null) {
+            return self::answer(503, ['error' => 'no_api_key']);
+        }
+        try {
+            $refund = $this->client->refunds->retrieve($refundId, ['max_retries' => 1]);
+        } catch (PerlyPayException $error) {
+            if ($error->getHttpStatus() === 404) {
+                return self::answer(200, ['received' => true, 'result' => 'not_ours']);
+            }
+            $this->log(['result' => 'Not applied yet: the refund could not be retrieved from Perly Pay, which sends the event again', 'event' => $eventId, 'type' => $type, 'invoice' => $payInvoice, 'refund' => Html::cut($refundId, 64), 'error' => $error->getErrorCode()], false);
+
+            return self::answer(503, ['error' => 'refund_unavailable']);
+        }
+
+        return ($refund['id'] ?? null) === $refundId && ($refund['invoice'] ?? null) === $payInvoice ? $refund : self::answer(200, ['received' => true, 'result' => 'not_ours']);
+    }
+
+    /**
+     * Whether the refund Perly Pay returned is in a state the event can mean, now or after it moved on: one that was
+     * opened is any refund; "address_received" needs one ready to send to an address (only then is there something
+     * to send); "sent" one sent or confirmed; "confirmed" and "canceled" their own status.
+     *
+     * @param array<string, mixed> $refund
+     */
+    private static function refundAgrees(string $type, array $refund): bool
+    {
+        $status = is_string($refund['status'] ?? null) ? $refund['status'] : '';
+
+        return match ($type) {
+            'refund.requested' => in_array($status, ['requested', 'awaiting_address', 'ready_to_send', 'sent', 'confirmed', 'canceled'], true),
+            'refund.address_received' => $status === 'ready_to_send' && is_string($refund['refund_address'] ?? null) && $refund['refund_address'] !== '',
+            'refund.sent' => in_array($status, ['sent', 'confirmed'], true),
+            'refund.confirmed' => $status === 'confirmed',
+            'refund.canceled' => $status === 'canceled',
+            default => false,
+        };
+    }
+
+    /**
+     * Whether the invoice Perly Pay returned is in a state the event can mean. An "invoice.fulfilled" needs a paid
+     * invoice that is fulfilled; the rest need the status they are named for (a refund event, either refund status).
+     *
+     * @param array<string, mixed> $invoice
+     */
+    private static function agrees(string $type, array $invoice): bool
+    {
+        $status = is_string($invoice['status'] ?? null) ? $invoice['status'] : '';
+
+        return match ($type) {
+            'invoice.fulfilled' => in_array($status, ['paid', 'overpaid'], true) && !empty($invoice['fulfilled_at']),
+            'invoice.paid', 'invoice.overpaid' => in_array($status, ['paid', 'overpaid'], true),
+            'invoice.refunded' => in_array($status, ['refunded', 'partially_refunded'], true),
+            default => 'invoice.' . $status === $type,
+        };
     }
 
     /**

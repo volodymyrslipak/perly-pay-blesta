@@ -48,7 +48,9 @@ Perly Pay.
   deliveries at the same moment cannot both hand it over: the first claims
   it.
 - Part payments, expiry, review holds and refunds are written to the
-  gateway log (Tools → Logs → Gateway), without recording a payment.
+  gateway log (Tools → Logs → Gateway), without recording a payment. A
+  refund's entry comes from the refund as Perly Pay's API returns it, never
+  from the webhook.
 - When the client comes back, Blesta's "payment received" page shows the
   payment as approved or pending. That page records nothing; the webhook
   does.
@@ -92,6 +94,9 @@ paste its secret, then pay one small real invoice and refund it.
 - What a payment records comes from Blesta's own table, written when the
   invoice was made from Blesta's figures, never from the webhook's body or
   the address the client comes back to.
+- Refund details (status, amount, address, transaction) are also confirmed
+  with Perly Pay's API, never taken from the webhook: a signed event cannot
+  put another address in the gateway log.
 - Both secrets are stored encrypted by Blesta. Keys, secrets, signatures and
   clients' emails never go to the gateway log.
 - Everything the gateway prints is escaped; every PHP file refuses to run
@@ -108,3 +113,8 @@ paste its secret, then pay one small real invoice and refund it.
 ## Licence
 
 MIT. Perly Pay's PHP SDK inside (`vendor/perly-pay-sdk`) is MIT too.
+
+## Changelog
+
+- **1.0.1**: Every payment is confirmed with Perly Pay's API before an order is completed: a signed webhook alone no longer marks an order paid, so a leaked signing secret cannot ship an unpaid order. Refund details are also confirmed with Perly Pay's API, never taken from the webhook, so a leaked signing secret cannot put its own address in a refund entry.
+- **1.0.0**: First release.
